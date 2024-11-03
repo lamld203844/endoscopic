@@ -1,4 +1,12 @@
-tpot
+numpy
+pandas
+matplotlib
+pillow
+joblib
+scikit-learn
+scipy
+opencv-python
+opencv-contrib-python
+pytest
 tqdm
-cv2
-sklearn
+tpot
