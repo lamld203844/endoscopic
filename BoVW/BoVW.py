@@ -1,79 +1,90 @@
+from typing import Optional
 import os
-from collections import Counter
 
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 
+from tqdm import tqdm
 from PIL import Image
 import cv2
 
-import joblib
-from sklearn.cluster import KMeans
+from sklearn.cluster import KMeans, MiniBatchKMeans
 from scipy.cluster.vq import vq
-
-np.random.seed(0)  # reproducibility
-
 
 class BagOfVisualWords:
     def __init__(
         self,
         root_dir: str = "/kaggle/input/the-hyper-kvasir-dataset/labeled_images",
-        method: str = "sift",
-        # k: int = 200,
-        all_descriptors_dir: str = None,
+        descriptors_lake_path: str = None,
         codebook_dir: str = None,
-        **extractor_kwargs
+        
+        method: str = 'sift',
+        extractor_kwargs: dict = None,
     ):
+        """Constructor method
+        
+        :param descriptors_lake_path: str (optional), path to file including all computed descriptors (vectors)
+        :param codebook_dir: str (optional), path to visual vocabulary
+        
+        """
         self.root_dir = root_dir
         self.df = pd.read_csv(f"{root_dir}/image-labels.csv")
         self.labels = tuple(self.df["Finding"].unique())
-        self.method = method
+        
+        # In reality in building codebook, choose small sample size idx for efficient 
+        self.samples_idx = []  
 
-        if method == "sift":
-            self.extractor = cv2.SIFT_create(**extractor_kwargs)
-        elif method == "orb":
+        # ------ extracting algorithms --------
+        self.method = method.lower()
+        if self.method == "sift":
+            self.extractor = cv2.SIFT_create()
+        elif self.method == "orb":
             self.extractor = cv2.ORB_create(**extractor_kwargs)
-        elif method == "surf":
+        elif self.method == "surf":
             self.extractor = cv2.xfeatures2d.SURF_create(**extractor_kwargs)
         else:
-            raise ValueError(f"Unsupported feature detection method: {method}")
-
-        # helper
-        if codebook_dir is not None:
-            self.k, self.codebook = joblib.load(codebook_dir)
-
-        if all_descriptors_dir is not None:
-            self.all_descriptors = joblib.load(all_descriptors_dir)
-
-        self.idf = 1
-        self.samples_idx = []  # small sample idx for building visual vocabulary
-
-    def extract_descriptors(self, sample_size=1000):
+            raise ValueError(f"Unsupported feature extracting method: {method}")
+            
+    def extract_descriptors(self, sample_size: int = 2000,
+                                grayscale: bool = True,
+                                strongest_percent: float = 1,
+                                **extractor_kwargs
+                        ) -> np.ndarray:
         """Extract descriptors from sample_size images
-        :param method: method to extract descriptors e.g. ORB, SIFT, SURF, etc
+        :param method: str, method to extract feature descriptors e.g. ORB, SIFT, SURF, etc
         :param sample_size: size of sample. (We likely use a small sample in real-world scenario,
             where whole dataset is big)
+        :param grayscale: bool - if True, convert to gray for efficient computing
+        :param strongest_percent: float - get % percent of strongest (based on .response of keypoints)
+        descriptors.  
 
-        :return: all descriptors of sample_size images
-        :rtype: list
+        :return: list, n descriptors x sample_size images
 
         # TODO: sample for building visual vocabulary must be balance between classes
         every class include at least one image
         """
-        self.sample_idx = np.random.randint(0, len(self.df) + 1, sample_size).tolist()
+        # ------- Sampling -----------
+        self.sample_idx = np.random.choice(np.arange(0, len(self.df)),
+                                            size=sample_size,
+                                            replace=False
+                                        ).tolist() #  randomly sample sample_size images
 
         descriptors_sample_all = (
             []
         )  # each image has many descriptors, descriptors_sample_all
-        # is all descriptors of sample_size images
+        # is a list of all descriptors of sample_size images
 
         # loop each image > extract > append
-        for n in self.sample_idx:
-            # descriptors extracting
-            img_descriptors = self._get_descriptors(n)
+        for idx in tqdm(self.sample_idx):
+            img_keypoints, img_descriptors = self._get_descriptors_one_img(idx)
             if img_descriptors is not None:
-                for descriptor in img_descriptors:
+                # filter top_percent strongest keypoint
+                sorted_couple = sorted(zip(img_keypoints, img_descriptors), key=lambda x: x[0].response, reverse=True)
+                img_keypoints, img_descriptors = zip(*sorted_couple) # unzip
+                top = int(len(img_keypoints) * strongest_percent)
+                top_descriptors = img_descriptors[:top]               
+
+                for descriptor in top_descriptors:
                     descriptors_sample_all.append(np.array(descriptor))
 
         # convert to single numpy array
@@ -83,42 +94,72 @@ class BagOfVisualWords:
 
     def build_codebook(
         self,
-        all_descriptors: np.array,
+        descriptors_lake: np.ndarray,
+        cluster_algorithm: str = 'kmean',
         k: int = 200,
-    ):
+        batch_size = 1000,
+        n_init: int = 10
+    ) -> np.ndarray:
         """Building visual vocabulary (visual words)
-        :param all_descriptors: array of descriptors
+        :param descriptors_lake: array of descriptors
+        :param cluster_algorithm: type of cluster algorithm like K-mean, Birch
         :param k: #cluster (centroids)
-        :param codebook_path: path to saving codebook
-
+        
         :return: #centroids, codebook
 
         """
-        kmeans = KMeans(n_clusters=k, random_state=123)
-        kmeans.fit(all_descriptors)
+        if cluster_algorithm.lower() in ['kmean', 'kmeans']:
+            cluster_model = MiniBatchKMeans(n_clusters=k,
+                                            batch_size=batch_size,
+                                            random_state=123,
+                                            n_init=n_init)
 
-        return kmeans.cluster_centers_
+        # n_batches = int(len(descriptors_lake) / batch_size)
+        for _ in tqdm(range(n_init), desc='Initializing'):
+            cluster_model.partial_fit(descriptors_lake)
 
-    def get_embedding(self, idx: int, normalized: bool = False, tfidf: bool = False):
-        """Get embeddings of image[idx] (image > descriptors > project in codebook > frequencies vectors)
-        :param idx: image index
-
-        :return: frequencies vector (can consider as embedding)
+        # Final clustering
+        cluster_model.fit(descriptors_lake)
+        return cluster_model.cluster_centers_
+    
+    # ------------------------ for inference ----------------------------
+    def get_embedding(
+        self,
+        idx: int,
+        codebook: np.ndarray,
+        normalized: bool = False,
+        tfidf: bool = False
+    ) -> np.ndarray:
+        """Get embeddings of image[idx] (image > descriptors > projection in codebook > frequencies vectors)
+        :param idx: int, image index
+        :param codebook: np.ndarray, visual vocabulary
+        :param normalized: bool, if True, normalize embedding in scale [0, 1]
+        
+        :return: np.array, frequencies vector (can consider as embedding)
         """
-        img_descriptors = self._get_descriptors(idx)
-        img_visual_words, distance = vq(img_descriptors, self.codebook)
-        img_frequency_vector = np.histogram(
-            img_visual_words, bins=self.k, density=normalized
-        )[0]
+        ## What if self._get_descriptors_one_img(idx) -> None???? #TODO
+        _, img_descriptors = self._get_descriptors_one_img(idx)
+        if img_descriptors is not None:
+            img_visual_words, distance = vq(img_descriptors, codebook)
+            img_frequency_vector = np.histogram(
+                img_visual_words, bins=codebook.shape[0], density=normalized
+            )[0]
+        else:
+            img_frequency_vector = np.zeros(self.codebook.shape[1])
 
         if tfidf:
-            self._tf_idf()
-            img_frequency_vector = img_frequency_vector * self.idf
-
+            # TODO
+            # self._tf_idf()
+            # img_frequency_vector = img_frequency_vector * self.idf
+            pass
+        
         return img_frequency_vector
+    # ------------------------ end / for inference / section ----------------------------
 
+    # TODO
     def _tf_idf(self):
         """TODO: Reweight important features in codebook"""
+        self.idf = 1
 
         all_embeddings = []
         for i in range(len(self.df)):
@@ -132,8 +173,33 @@ class BagOfVisualWords:
         idf = np.log(N / df)
 
         return idf
+    # TODO
 
-    def _get_descriptors(self, idx, grayscale=True):
+    def _get_item(self, idx) -> tuple:
+        """Return pair (image(arr), label)
+        :param idx: index of data
+
+        :return: tuple, (image: np.array, label)
+        """
+        # get path of image
+        GI_dir = {"Lower GI": "lower-gi-tract", "Upper GI": "upper-gi-tract"}
+
+        img = self.df["Video file"][idx]
+        gi_tract = GI_dir[self.df["Organ"][idx]]
+        classification = self.df["Classification"][idx]
+        finding = self.df["Finding"][idx]
+        path = f"""{self.root_dir}/{gi_tract}/{classification}/{finding}/{img}.jpg"""
+        assert (
+            os.path.exists(path) == True
+        ), f"{path} does not exist"  # dir existance checking
+
+        # read image
+        image = np.array(Image.open(path))
+        label = self.labels.index(finding)
+
+        return image, label
+    
+    def _get_descriptors_one_img(self, idx, grayscale=True):
         """Extracting descriptors for each image[idx]
         :param method: method to extract features e.g. ORB, SIFT, SURF, etc
         :param idx: image index
@@ -148,50 +214,6 @@ class BagOfVisualWords:
             img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
         # descriptors extracting
-        _, img_descriptors = self.extractor.detectAndCompute(img, None)
-
-        return img_descriptors
-
-    def _get_item(self, idx):
-        """Return pair (image(arr), label)
-        :param idx: index of data
-
-        :return:
-            tuple (image: array, label)
-        """
-        # get path of image
-        GI_dir = {"Lower GI": "lower-gi-tract", "Upper GI": "upper-gi-tract"}
-
-        img = self.df["Video file"][idx]
-        gi_tract = GI_dir[self.df["Organ"][idx]]
-        classification = self.df["Classification"][idx]
-        finding = self.df["Finding"][idx]
-        path = f"""{self.root_dir}/{gi_tract}/{classification}/{finding}/{img}.jpg"""
-        assert (
-            os.path.exists(path) == True
-        ), "File does not exist"  # dir existance checking
-
-        # read image
-        image = np.array(Image.open(path))
-        label = self.labels.index(finding)
-
-        return image, label
-
-
-if __name__ == "__main__":
-    model = BagOfVisualWords(
-        root_dir="/media/mountHDD2/lamluuduc/endoscopy/dataset/hyperKvasir/labeled-images",
-        codebook_dir="bovw_codebook_sift.pkl",
-    )
-    # # 1. extracting descriptors
-    # all_descriptors = model.extract_descriptors(sample_size=2000)
-    # joblib.dump(all_descriptors, f'sample_all_descriptors.pkl', compress=3) # saving all descriptors
-
-    # # 2. building visual vocabulary
-    # k = 200
-    # all_descriptors = joblib.load('all_descriptors_sift.pkl')
-    # codebook = model.build_codebook(all_descriptors, k)
-    # joblib.dump((k, codebook), f'bovw_codebook_{model.method}.pkl', compress=3) # saving codebook
-
-    embedding = model.get_embedding(0, normalized=True)
-    # plt.bar(list(range(len(embedding))),embedding)
+        img_keypoints, img_descriptors = self.extractor.detectAndCompute(img, None)
+    
+        return img_keypoints, img_descriptors

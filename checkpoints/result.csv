@@ -1,0 +1,2 @@
+feature_extractor,strongest_percent,clustering_algorithm,vector_size,mean_precision_macro,mean_precision_micro,mean_recall_macro,mean_recall_micro,mean_f1_macro,mean_f1_micro
+SIFT,1,KMeans,128,1.0,1.0,1.0,1.0,1.0,1.0
