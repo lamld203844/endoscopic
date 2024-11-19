@@ -15,11 +15,11 @@ class BagOfVisualWords:
     def __init__(
         self,
         root_dir: str = "/kaggle/input/the-hyper-kvasir-dataset/labeled_images",
-        descriptors_lake_path: str = None,
-        codebook_dir: str = None,
+        descriptors_lake_path: str = '',
+        codebook_dir: str = '',
         
         method: str = 'sift',
-        extractor_kwargs: dict = None,
+        extractor_kwargs: dict = {},
     ):
         """Constructor method
         

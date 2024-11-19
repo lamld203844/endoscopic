@@ -30,7 +30,7 @@ hyperparams = {
     'strongest_percent': 1,
     'clustering_algorithm': 'KMeans',
     'vector_size': 128
- }
+}
 # descriptors extracting
 method = hyperparams['feature_extractor']
 strongest_percent = hyperparams['strongest_percent']
